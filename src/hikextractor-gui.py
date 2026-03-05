@@ -2,19 +2,21 @@ import sys
 import os
 import stat
 import subprocess
+import tempfile
 import traceback
-from typing import Optional
+from typing import Optional, Set
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLineEdit, QLabel, QFileDialog, QTableWidget,
     QTableWidgetItem, QHeaderView, QCheckBox, QProgressBar, QMessageBox,
     QGridLayout, QSizePolicy, QDialog, QListWidget, QDialogButtonBox,
+    QStyledItemDelegate,
 )
 from PyQt6.QtCore import (
-    Qt, QObject, QRunnable, QThreadPool, pyqtSignal, QDir, QSettings,
+    Qt, QObject, QRunnable, QThreadPool, pyqtSignal, QDir, QSettings, QSize,
 )
-from PyQt6.QtGui import QFont, QIcon
+from PyQt6.QtGui import QFont, QIcon, QPixmap, QPainter, QPen, QColor, QBrush
 
 # Import your forensic logic from the other file
 try:
@@ -157,7 +159,108 @@ class ParserWorker(QRunnable):
             self.signals.finished.emit()
 
 
-# --- 3. Main GUI Window ---
+def _channel_brush(channel: int) -> QBrush:
+    """Returns a muted, dark-theme-friendly color unique to each channel number."""
+    hue = (channel * 53) % 360   # 53 is coprime with 360 → good spread
+    return QBrush(QColor.fromHsv(hue, 130, 130))
+
+
+# --- 3. Day-border delegate ---
+class DayBorderDelegate(QStyledItemDelegate):
+    """Paints thumbnails in col 0, scaled to fit the cell."""
+
+    def paint(self, painter: QPainter, option, index):
+        super().paint(painter, option, index)
+
+        if index.column() == 0:
+            pixmap = index.data(Qt.ItemDataRole.UserRole)
+            if isinstance(pixmap, QPixmap) and not pixmap.isNull():
+                target = option.rect.adjusted(2, 2, -2, -2)
+                scaled = pixmap.scaled(
+                    target.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                x = target.x() + (target.width() - scaled.width()) // 2
+                y = target.y() + (target.height() - scaled.height()) // 2
+                painter.drawPixmap(x, y, scaled)
+
+
+# --- 4. Thumbnail worker ---
+class ThumbnailSignals(QObject):
+    ready = pyqtSignal(int, QPixmap)   # row, thumbnail pixmap
+
+
+class ThumbnailWorker(QRunnable):
+    """Reads the first few MB of a video block and extracts a preview frame via ffmpeg."""
+
+    READ_SIZE = 4 * 1024 * 1024  # First 4 MB is enough to hit an I-frame
+
+    def __init__(self, row: int, source_path: str, entry: HIKBTREEEntry, block_size: int):
+        super().__init__()
+        self.row = row
+        self.source_path = source_path
+        self.entry = entry
+        self.block_size = block_size
+        self.signals = ThumbnailSignals()
+
+    def run(self):
+        try:
+            read_size = min(self.READ_SIZE, self.block_size)
+            start = self.entry.offset_datablock
+
+            st = os.stat(self.source_path)
+            if stat.S_ISBLK(st.st_mode):
+                fd = os.open(self.source_path, os.O_RDONLY)
+                try:
+                    data = os.pread(fd, read_size, start)
+                finally:
+                    os.close(fd)
+            else:
+                with open(self.source_path, "rb") as f:
+                    f.seek(start)
+                    data = f.read(read_size)
+
+            # Locate MPEG-PS pack start code
+            nal_pos = data.find(b"\x00\x00\x01\xba")
+            if nal_pos < 0:
+                return
+            data = data[nal_pos:]
+
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".jpg")
+            os.close(tmp_fd)
+            try:
+                proc = subprocess.Popen(
+                    [
+                        "ffmpeg",
+                        "-err_detect", "ignore_err",
+                        "-i", "pipe:0",
+                        "-frames:v", "1",
+                        "-vf", "scale=160:-1",
+                        "-loglevel", "error",
+                        "-y", tmp_path,
+                    ],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                proc.communicate(input=data, timeout=15)
+                if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
+                    pixmap = QPixmap(tmp_path)
+                    if not pixmap.isNull():
+                        self.signals.ready.emit(self.row, pixmap)
+            except Exception:
+                pass
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+        except Exception:
+            pass
+
+
+# --- 5. Main GUI Window ---
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -165,8 +268,12 @@ class MainWindow(QMainWindow):
         self.setGeometry(100, 100, 1050, 720)
 
         self.threadpool = QThreadPool()
+        self.thumb_pool = QThreadPool()
+        self.thumb_pool.setMaxThreadCount(2)
         self.current_parser: Optional[HikvisionParser] = None
         self._elevated_devices: list[str] = []  # devices we chmod'd; restored on close
+        self._delegate = DayBorderDelegate(self)
+        self._thumb_cache: dict[tuple, QPixmap] = {}
 
         self._setup_ui()
         self._apply_style()
@@ -233,22 +340,23 @@ class MainWindow(QMainWindow):
 
         # --- C. Results Table (HIKBTREE Entries) ---
         self.table_segments = QTableWidget()
-        self.table_segments.setColumnCount(5)
+        self.table_segments.setColumnCount(6)
         self.table_segments.setHorizontalHeaderLabels(
-            ["CH", "Start Time (UTC)", "End Time (UTC)", "Recording", "Data Offset"]
+            ["Preview", "CH", "Start Time (UTC)", "End Time (UTC)", "Recording", "Data Offset"]
         )
-        self.table_segments.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.ResizeMode.ResizeToContents
-        )
-        self.table_segments.horizontalHeader().setSectionResizeMode(
-            1, QHeaderView.ResizeMode.Stretch
-        )
-        self.table_segments.horizontalHeader().setSectionResizeMode(
-            2, QHeaderView.ResizeMode.Stretch
-        )
+        hdr = self.table_segments.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.table_segments.setColumnWidth(0, 170)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        self.table_segments.verticalHeader().setDefaultSectionSize(90)
         self.table_segments.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table_segments.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
         self.table_segments.verticalHeader().setVisible(False)
+        self.table_segments.setItemDelegate(self._delegate)
         main_layout.addWidget(self.table_segments)
         
         # --- D. Export Controls & Progress ---
@@ -407,9 +515,9 @@ class MainWindow(QMainWindow):
         worker.signals.finished.connect(self.worker_finished)
         self.threadpool.start(worker)
 
-    def parsing_complete(self, master: MasterBlock, entry_list: List[HIKBTREEEntry]):
+    def parsing_complete(self, master: MasterBlock, entry_list: list[HIKBTREEEntry]):
         """Slot called when metadata parsing is done."""
-        
+
         # 1. Update Metadata Display
         metadata_text = (
             f"<b>HD Signature:</b> {master.signature.decode('utf-8')}<br>"
@@ -418,35 +526,56 @@ class MainWindow(QMainWindow):
             f"<b>Time System Init:</b> {master.time_system_init:%Y-%m-%d %H:%M}"
         )
         self.metadata_label.setText(metadata_text)
-        
+
         # 2. Populate the table
         self.table_segments.setRowCount(len(entry_list))
+
+        block_size = master.size_data_block
         for row, entry in enumerate(entry_list):
-            # Channel
-            self.table_segments.setItem(row, 0, QTableWidgetItem(f"{entry.channel:02d}"))
-            
-            # Start Time
-            start_time = "N/A"
-            if entry.start_timestamp:
-                start_time = f"{entry.start_timestamp:%Y-%m-%d %H:%M:%S}"
-            self.table_segments.setItem(row, 1, QTableWidgetItem(start_time))
-            
-            # End Time
-            end_time = "N/A"
-            if entry.end_timestamp:
-                end_time = f"{entry.end_timestamp:%Y-%m-%d %H:%M:%S}"
-            self.table_segments.setItem(row, 2, QTableWidgetItem(end_time))
+            def _item(text=""):
+                return QTableWidgetItem(text)
 
-            # Recording Status
-            rec_status = "Yes" if entry.recording else "No"
-            self.table_segments.setItem(row, 3, QTableWidgetItem(rec_status))
+            # Preview placeholder (thumbnail filled in asynchronously)
+            preview_item = _item()
+            preview_item.setFlags(preview_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.table_segments.setItem(row, 0, preview_item)
 
-            # Data Offset
-            self.table_segments.setItem(row, 4, QTableWidgetItem(f"0x{entry.offset_datablock:X}"))
+            ch_item = QTableWidgetItem(f"{entry.channel:02d}")
+            ch_item.setBackground(_channel_brush(entry.channel))
+            self.table_segments.setItem(row, 1, ch_item)
+
+            start_time = f"{entry.start_timestamp:%Y-%m-%d %H:%M:%S}" if entry.start_timestamp else "N/A"
+            self.table_segments.setItem(row, 2, _item(start_time))
+
+            end_time = f"{entry.end_timestamp:%Y-%m-%d %H:%M:%S}" if entry.end_timestamp else "N/A"
+            self.table_segments.setItem(row, 3, _item(end_time))
+
+            self.table_segments.setItem(row, 4, _item("Yes" if entry.recording else "No"))
+            self.table_segments.setItem(row, 5, _item(f"0x{entry.offset_datablock:X}"))
+
+            # Serve from cache or kick off thumbnail generation
+            if not entry.recording:
+                cache_key = (self.current_parser.source_path, entry.offset_datablock)
+                if cache_key in self._thumb_cache:
+                    preview_item.setData(Qt.ItemDataRole.UserRole, self._thumb_cache[cache_key])
+                else:
+                    worker = ThumbnailWorker(row, self.current_parser.source_path, entry, block_size)
+                    worker.signals.ready.connect(self._on_thumbnail_ready)
+                    self.thumb_pool.start(worker)
 
         self.table_segments.resizeColumnsToContents()
+        self.table_segments.setColumnWidth(0, 170)  # keep preview column fixed after resize
         self.status_bar.showMessage(f"Parsing complete. Found {len(entry_list)} video segments.")
         self.btn_export_selected.setEnabled(True)
+
+    def _on_thumbnail_ready(self, row: int, pixmap: QPixmap):
+        """Slot: stores the thumbnail pixmap on the preview cell and populates the cache."""
+        item = self.table_segments.item(row, 0)
+        if item:
+            item.setData(Qt.ItemDataRole.UserRole, pixmap)
+        if self.current_parser and row < len(self.current_parser.entry_list):
+            entry = self.current_parser.entry_list[row]
+            self._thumb_cache[(self.current_parser.source_path, entry.offset_datablock)] = pixmap
         
     def start_export_selected(self):
         """Initiates the export process for selected segments."""
