@@ -56,17 +56,46 @@ class ParserWorker(QRunnable):
             # --- PHASE 2: EXPORTING ---
             total_entries = len(self.entry_list)
             if total_entries > 0 and self.dest_folder:
-                self.signals.export_started.emit(total_entries)
-                
+                block_size = self.parser.master_block.size_data_block
+                total_mb = max(1, (total_entries * block_size) // (1024 * 1024))
+                self.signals.export_started.emit(total_mb)
+
+                completed_bytes = 0
                 for i, entry in enumerate(self.entry_list):
-                    # Skip 'recording' blocks for export unless explicitly handled
+                    ch = f"CH-{entry.channel:02d}"
+
                     if entry.recording:
-                        self.signals.export_progress.emit(i + 1, f"Skipping CH-{entry.channel:02d} (Recording)")
+                        completed_bytes += block_size
+                        self.signals.export_progress.emit(
+                            completed_bytes // (1024 * 1024),
+                            f"Skipping {ch} (Recording)"
+                        )
                         continue
-                        
-                    # Perform the actual file export
-                    filename = self.parser.export_video_block(entry, self.dest_folder, self.raw)
-                    self.signals.export_progress.emit(i + 1, f"Exported: {os.path.basename(filename)}")
+
+                    base = completed_bytes  # captured for the closure below
+
+                    def on_progress(done, total, _base=base, _ch=ch, _i=i):
+                        mb_done = (_base + done) // (1024 * 1024)
+                        if done < total:
+                            self.signals.export_progress.emit(
+                                mb_done,
+                                f"Reading {_ch} ({_i+1}/{total_entries}): "
+                                f"{done//(1024*1024)}/{total//(1024*1024)} MB"
+                            )
+                        else:
+                            self.signals.export_progress.emit(
+                                mb_done,
+                                f"Converting {_ch} ({_i+1}/{total_entries})…"
+                            )
+
+                    filename = self.parser.export_video_block(
+                        entry, self.dest_folder, self.raw, on_progress=on_progress
+                    )
+                    completed_bytes += block_size
+                    self.signals.export_progress.emit(
+                        completed_bytes // (1024 * 1024),
+                        f"Done ({i+1}/{total_entries}): {os.path.basename(filename)}"
+                    )
 
         except Exception as e:
             # Catch any exception and emit it to the main thread
