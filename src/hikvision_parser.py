@@ -433,8 +433,15 @@ class HikvisionParser:
         
         return master, entrylist
 
-    def export_video_block(self, entry: HIKBTREEEntry, dest_folder: str, raw: bool):
-        """Exports a single video block based on a HIKBTREE entry."""
+    def export_video_block(self, entry: HIKBTREEEntry, dest_folder: str, raw: bool,
+                           on_progress=None):
+        """Exports a single video block based on a HIKBTREE entry.
+
+        on_progress(bytes_done, total_bytes):
+          - called repeatedly during the read phase with bytes_done < total_bytes
+          - called once with bytes_done == total_bytes when reading is done
+            and ffmpeg conversion is about to start
+        """
         if not self.master_block:
             raise Exception("Metadata not parsed. Run parse_metadata first.")
 
@@ -467,6 +474,8 @@ class HikvisionParser:
                         break
                     parts.append(chunk)
                     done += len(chunk)
+                    if on_progress:
+                        on_progress(done, block_size)
                 datablock = b"".join(parts)
             finally:
                 os.close(fd)
@@ -477,6 +486,12 @@ class HikvisionParser:
                     input_image.fileno(), size, access=mmap.ACCESS_READ
                 ) as mmapped_file:
                     datablock = bytes(mmapped_file[start_offset:end_offset])
+            if on_progress:
+                on_progress(block_size, block_size)
+
+        # Signal that read is complete; ffmpeg conversion starting now
+        if on_progress:
+            on_progress(block_size, block_size)
 
         _do_export_file(datablock, full_path, raw)
         return full_path
