@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QLineEdit, QLabel, QFileDialog, QTableWidget,
     QTableWidgetItem, QHeaderView, QCheckBox, QProgressBar, QMessageBox,
     QGridLayout, QSizePolicy, QDialog, QListWidget, QDialogButtonBox,
-    QStyledItemDelegate,
+    QStyledItemDelegate, QComboBox,
 )
 from PyQt6.QtCore import (
     Qt, QObject, QRunnable, QThreadPool, pyqtSignal, QDir, QSettings, QSize,
@@ -357,6 +357,17 @@ class MainWindow(QMainWindow):
         self.table_segments.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
         self.table_segments.verticalHeader().setVisible(False)
         self.table_segments.setItemDelegate(self._delegate)
+
+        # --- C2. Channel filter bar ---
+        filter_layout = QHBoxLayout()
+        self.combo_channel_filter = QComboBox()
+        self.combo_channel_filter.addItem("All channels")
+        self.combo_channel_filter.setMinimumWidth(160)
+        self.combo_channel_filter.currentIndexChanged.connect(self._apply_channel_filter)
+        filter_layout.addWidget(self.combo_channel_filter)
+        filter_layout.addStretch()
+        main_layout.addLayout(filter_layout)
+
         main_layout.addWidget(self.table_segments)
         
         # --- D. Export Controls & Progress ---
@@ -565,6 +576,15 @@ class MainWindow(QMainWindow):
 
         self.table_segments.resizeColumnsToContents()
         self.table_segments.setColumnWidth(0, 170)  # keep preview column fixed after resize
+
+        # Populate channel filter (block signals to avoid triggering filter during rebuild)
+        self.combo_channel_filter.blockSignals(True)
+        self.combo_channel_filter.clear()
+        self.combo_channel_filter.addItem("All channels")
+        for ch in sorted({e.channel for e in entry_list}):
+            self.combo_channel_filter.addItem(f"Channel {ch:02d}", userData=ch)
+        self.combo_channel_filter.blockSignals(False)
+
         self.status_bar.showMessage(f"Parsing complete. Found {len(entry_list)} video segments.")
         self.btn_export_selected.setEnabled(True)
 
@@ -576,7 +596,15 @@ class MainWindow(QMainWindow):
         if self.current_parser and row < len(self.current_parser.entry_list):
             entry = self.current_parser.entry_list[row]
             self._thumb_cache[(self.current_parser.source_path, entry.offset_datablock)] = pixmap
-        
+
+    def _apply_channel_filter(self):
+        """Show only rows matching the selected channel (or all rows)."""
+        selected_ch = self.combo_channel_filter.currentData()  # None for "All channels"
+        entry_list = self.current_parser.entry_list if self.current_parser else []
+        for row, entry in enumerate(entry_list):
+            hide = selected_ch is not None and entry.channel != selected_ch
+            self.table_segments.setRowHidden(row, hide)
+
     def start_export_selected(self):
         """Initiates the export process for selected segments."""
         if not self.current_parser or not self.current_parser.entry_list:
