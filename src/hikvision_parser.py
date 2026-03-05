@@ -2,11 +2,16 @@ import mmap
 import struct
 import subprocess
 import sys
+import os
 import os.path
+import stat
 import argparse
 import dataclasses
 from datetime import datetime
 from typing import List, Optional, Tuple, Any
+
+# Use the robust export pipeline from the CLI module
+from hikextractor import export_file as _do_export_file
 
 # --- Constants from Original Script ---
 SIGNATURE = b"HIKVISION@HANGZHOU"
@@ -62,6 +67,43 @@ def find_in_bytes(buff: bytes, what: bytes, start, size=1024 * 1024):
 
 def get_file_size(fp):
     return fp.seek(0, os.SEEK_END)
+
+
+class _SeekReader:
+    """
+    Slice-addressable wrapper around a file/device that uses os.pread()
+    instead of mmap.  Avoids SIGBUS on block devices with bad sectors or
+    sparse regions — pread raises OSError instead of crashing the process.
+    """
+
+    def __init__(self, path: str):
+        self._fd = os.open(path, os.O_RDONLY)
+        self._size = os.lseek(self._fd, 0, os.SEEK_END)
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            start, stop, _ = key.indices(self._size)
+            length = max(0, stop - start)
+            return os.pread(self._fd, length, start) if length else b""
+        if isinstance(key, int):
+            if key < 0:
+                key += self._size
+            data = os.pread(self._fd, 1, key)
+            return data[0] if data else 0
+        raise TypeError(f"Unsupported index type: {type(key)}")
+
+    def __len__(self):
+        return self._size
+
+    def close(self):
+        os.close(self._fd)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
 
 # --- Parsing functions (No change needed) ---
 def parse_master_block(mappedfile) -> MasterBlock:
@@ -240,20 +282,28 @@ class HikvisionParser:
         self.entry_list: List[HIKBTREEEntry] = []
         
     def parse_metadata(self) -> Tuple[MasterBlock, List[HIKBTREEEntry]]:
-        """Parses the MasterBlock and HIKBTREE from the disk image."""
+        """Parses the MasterBlock and HIKBTREE from the disk image or block device."""
         if not os.path.exists(self.source_path):
-            raise FileNotFoundError(f"Input file not found: {self.source_path}")
+            raise FileNotFoundError(f"Input not found: {self.source_path}")
+        st = os.stat(self.source_path)
+        if not (stat.S_ISREG(st.st_mode) or stat.S_ISBLK(st.st_mode)):
+            raise ValueError(f"Input must be a regular file or block device: {self.source_path}")
 
-        with open(self.source_path, "rb") as input_image:
-            file_size = get_file_size(input_image)
-            with mmap.mmap(
-                input_image.fileno(), file_size, access=mmap.ACCESS_READ
-            ) as mmapped_file:
-                # 1. Parse Master Block
-                master = parse_master_block(mmapped_file)
-                
-                # 2. Parse HIKBTREE Index
-                entrylist = parse_hbtree(mmapped_file, master)
+        is_device = stat.S_ISBLK(os.stat(self.source_path).st_mode)
+
+        if is_device:
+            # Use pread-based reader to avoid SIGBUS on block devices
+            with _SeekReader(self.source_path) as reader:
+                master = parse_master_block(reader)
+                entrylist = parse_hbtree(reader, master)
+        else:
+            with open(self.source_path, "rb") as input_image:
+                size = get_file_size(input_image)
+                with mmap.mmap(
+                    input_image.fileno(), size, access=mmap.ACCESS_READ
+                ) as mmapped_file:
+                    master = parse_master_block(mmapped_file)
+                    entrylist = parse_hbtree(mmapped_file, master)
 
         # Sort entries: Recording first, then by timestamp, then by channel
         def sortkey(x):
@@ -273,7 +323,6 @@ class HikvisionParser:
         if not self.master_block:
             raise Exception("Metadata not parsed. Run parse_metadata first.")
 
-        # Determine filename
         ext = "h264" if raw else "mp4"
         if entry.recording:
             filename = f"CH-{entry.channel:02d}__RECORDING.{ext}"
@@ -281,19 +330,38 @@ class HikvisionParser:
             start = entry.start_timestamp
             end = entry.end_timestamp
             filename = f"CH-{entry.channel:02d}__{start:%Y-%m-%d-%H-%M}__{end:%Y-%m-%d-%H-%M}.{ext}"
-            
-        full_path = rename_file_if_exists(os.path.join(dest_folder, filename))
-        
-        # Read the specific data block from the disk image
-        start_offset = entry.offset_datablock
-        end_offset = start_offset + self.master_block.size_data_block
-        
-        with open(self.source_path, "rb") as input_image, mmap.mmap(
-            input_image.fileno(), 0, access=mmap.ACCESS_READ
-        ) as mmapped_file:
-            datablock = mmapped_file[start_offset:end_offset]
-            
-        # Export the file (remuxing or raw)
-        export_file(datablock, full_path, raw)
 
+        full_path = rename_file_if_exists(os.path.join(dest_folder, filename))
+
+        block_size = self.master_block.size_data_block
+        start_offset = entry.offset_datablock
+        end_offset = start_offset + block_size
+
+        st = os.stat(self.source_path)
+        if stat.S_ISBLK(st.st_mode):
+            # Read in 4 MB chunks from block device
+            CHUNK = 4 * 1024 * 1024
+            fd = os.open(self.source_path, os.O_RDONLY)
+            try:
+                parts = []
+                done = 0
+                while done < block_size:
+                    to_read = min(CHUNK, block_size - done)
+                    chunk = os.pread(fd, to_read, start_offset + done)
+                    if not chunk:
+                        break
+                    parts.append(chunk)
+                    done += len(chunk)
+                datablock = b"".join(parts)
+            finally:
+                os.close(fd)
+        else:
+            with open(self.source_path, "rb") as input_image:
+                size = get_file_size(input_image)
+                with mmap.mmap(
+                    input_image.fileno(), size, access=mmap.ACCESS_READ
+                ) as mmapped_file:
+                    datablock = bytes(mmapped_file[start_offset:end_offset])
+
+        _do_export_file(datablock, full_path, raw)
         return full_path
