@@ -1,15 +1,18 @@
 import sys
 import os
+import stat
+import subprocess
 import traceback
+from typing import Optional
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLineEdit, QLabel, QFileDialog, QTableWidget,
     QTableWidgetItem, QHeaderView, QCheckBox, QProgressBar, QMessageBox,
-    QGridLayout, QSizePolicy
+    QGridLayout, QSizePolicy, QDialog, QListWidget, QDialogButtonBox,
 )
 from PyQt6.QtCore import (
-    Qt, QObject, QRunnable, QThreadPool, pyqtSignal, QDir
+    Qt, QObject, QRunnable, QThreadPool, pyqtSignal, QDir, QSettings,
 )
 from PyQt6.QtGui import QFont, QIcon
 
@@ -19,6 +22,56 @@ try:
 except ImportError:
     print("Error: Could not import hikvision_parser. Make sure it's in the same directory.")
     sys.exit(1)
+
+
+# --- 0. Device Selection Dialog ---
+class DeviceSelectDialog(QDialog):
+    """Dialog that lists available block devices via lsblk."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select Block Device")
+        self.setMinimumWidth(500)
+        self.selected_device = None
+        self._setup_ui()
+        self._populate_devices()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Available block devices (double-click or select and press OK):"))
+        self.device_list = QListWidget()
+        self.device_list.itemDoubleClicked.connect(self._accept_selection)
+        layout.addWidget(self.device_list)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._accept_selection)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _populate_devices(self):
+        try:
+            result = subprocess.run(
+                ["lsblk", "-dpno", "NAME,SIZE,MODEL"],
+                capture_output=True, text=True, timeout=5
+            )
+            lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+            if lines:
+                for line in lines:
+                    self.device_list.addItem(line)
+            else:
+                self.device_list.addItem("No block devices found")
+        except FileNotFoundError:
+            self.device_list.addItem("lsblk not available — type device path manually in the input field")
+        except Exception as e:
+            self.device_list.addItem(f"Error listing devices: {e}")
+
+    def _accept_selection(self):
+        item = self.device_list.currentItem()
+        if item:
+            # First token is the device path (e.g. /dev/sdb)
+            self.selected_device = item.text().split()[0]
+            self.accept()
 
 
 # --- 1. Worker Signals (Communication from Thread to GUI) ---
@@ -108,12 +161,13 @@ class ParserWorker(QRunnable):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Hikvision Disk Image Forensic Extractor")
-        self.setGeometry(100, 100, 1000, 700)
-        
+        self.setWindowTitle("Hikvision DVR Forensic Extractor — Image & Device")
+        self.setGeometry(100, 100, 1050, 720)
+
         self.threadpool = QThreadPool()
         self.current_parser: Optional[HikvisionParser] = None
-        
+        self._elevated_devices: list[str] = []  # devices we chmod'd; restored on close
+
         self._setup_ui()
         self._apply_style()
 
@@ -128,25 +182,39 @@ class MainWindow(QMainWindow):
         input_layout = QGridLayout(input_group)
         input_layout.setContentsMargins(0, 0, 0, 0)
         
-        self.input_path_line = QLineEdit("Select a raw disk image (.dd, .img, .bin)")
-        self.input_path_line.setReadOnly(True)
-        self.btn_open_file = QPushButton("Open Disk Image")
+        self.input_path_line = QLineEdit()
+        self.input_path_line.setPlaceholderText("Select a disk image or block device (e.g. /dev/sdb)")
+        self.input_path_line.textChanged.connect(self._on_input_changed)
+        self.btn_open_file = QPushButton("Open Image")
+        self.btn_open_file.setObjectName("btn_file")
         self.btn_open_file.clicked.connect(self.select_input_file)
-        
-        self.output_path_line = QLineEdit("Select an output directory for videos")
+        self.btn_open_device = QPushButton("Select Device")
+        self.btn_open_device.setObjectName("btn_device")
+        self.btn_open_device.clicked.connect(self.select_device)
+
+        self.output_path_line = QLineEdit()
         self.output_path_line.setReadOnly(True)
+        saved_output = QSettings("hikextractor", "gui").value("output_dir", "")
+        self.output_path_line.setText(saved_output if saved_output else "Select an output directory for videos")
         self.btn_select_output = QPushButton("Select Output Folder")
         self.btn_select_output.clicked.connect(self.select_output_directory)
 
         self.btn_parse = QPushButton("1. PARSE METADATA")
         self.btn_parse.clicked.connect(self.start_parsing)
         self.btn_parse.setFont(QFont("Arial", 10, QFont.Weight.Bold))
-        self.btn_parse.setEnabled(False) # Enable after file selection
+        self.btn_parse.setEnabled(False)  # Enable after input is set
 
         # Layout for Input
-        input_layout.addWidget(QLabel("Input Image:"), 0, 0)
+        input_layout.addWidget(QLabel("Input:"), 0, 0)
         input_layout.addWidget(self.input_path_line, 0, 1)
-        input_layout.addWidget(self.btn_open_file, 0, 2)
+        btn_open_layout = QHBoxLayout()
+        btn_open_layout.setSpacing(6)
+        btn_open_layout.setContentsMargins(0, 0, 0, 0)
+        btn_open_layout.addWidget(self.btn_open_file)
+        btn_open_layout.addWidget(self.btn_open_device)
+        btn_open_container = QWidget()
+        btn_open_container.setLayout(btn_open_layout)
+        input_layout.addWidget(btn_open_container, 0, 2)
         
         input_layout.addWidget(QLabel("Output Folder:"), 1, 0)
         input_layout.addWidget(self.output_path_line, 1, 1)
@@ -157,7 +225,7 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(input_group)
         
         # --- B. Metadata Display ---
-        self.metadata_label = QLabel("Ready to load disk image...")
+        self.metadata_label = QLabel("Ready. Select a disk image file or a block device to begin.")
         self.metadata_label.setWordWrap(True)
         self.metadata_label.setStyleSheet("padding: 10px; border: 1px dashed #555555;")
         main_layout.addWidget(self.metadata_label)
@@ -205,37 +273,122 @@ class MainWindow(QMainWindow):
         self.status_bar = self.statusBar()
 
     # --- UI Logic Methods ---
+    def _on_input_changed(self, text: str):
+        """Enable Parse button as soon as input field has any text."""
+        self.btn_parse.setEnabled(bool(text.strip()))
+
+    def _set_input(self, path: str):
+        """Set the input path, initialise the parser, and check device permissions."""
+        self.input_path_line.setText(path)
+        self.current_parser = HikvisionParser(path)
+        self.status_bar.showMessage(f"Input set: {path}")
+
+        # If this is a block device we can't read, offer privilege escalation
+        if os.path.exists(path):
+            try:
+                st = os.stat(path)
+                if stat.S_ISBLK(st.st_mode) and not os.access(path, os.R_OK):
+                    self._prompt_escalate(path)
+            except OSError:
+                pass
+
+    def _prompt_escalate(self, device_path: str):
+        """Ask the user to grant read permission on the device via pkexec."""
+        reply = QMessageBox.question(
+            self,
+            "Elevated Privileges Required",
+            f"Reading <b>{device_path}</b> requires root access.<br><br>"
+            "Grant read permission to this device? You will be prompted for your password.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._grant_device_access(device_path)
+
+    def _grant_device_access(self, device_path: str):
+        """Run pkexec chmod o+r on the device so we can read it as a normal user."""
+        try:
+            result = subprocess.run(
+                ["pkexec", "chmod", "o+r", device_path],
+                capture_output=True,
+            )
+            if result.returncode == 0:
+                self._elevated_devices.append(device_path)
+                self.status_bar.showMessage(f"Read access granted to {device_path}")
+            else:
+                err = result.stderr.decode("utf-8", "ignore").strip()
+                QMessageBox.warning(
+                    self,
+                    "Access Denied",
+                    f"Could not grant read access to <b>{device_path}</b>.<br><br>"
+                    f"{err}<br><br>"
+                    f"You can do it manually with:<br><code>sudo chmod o+r {device_path}</code>",
+                )
+        except FileNotFoundError:
+            QMessageBox.warning(
+                self,
+                "pkexec Not Found",
+                f"Please grant access manually from a terminal:<br><br>"
+                f"<code>sudo chmod o+r {device_path}</code>",
+            )
+
+    def closeEvent(self, event):
+        """Restore device permissions that were relaxed during this session."""
+        for device in self._elevated_devices:
+            subprocess.run(["pkexec", "chmod", "o-r", device], capture_output=True)
+        super().closeEvent(event)
+
     def select_input_file(self):
-        """Opens a file dialog for the disk image."""
+        """Opens a file dialog for a disk image."""
         filename, _ = QFileDialog.getOpenFileName(
-            self, 
-            "Open Hikvision Disk Image", 
+            self,
+            "Open Hikvision Disk Image",
             QDir.homePath(),
             "Raw Disk Images (*.dd *.img *.bin);;All Files (*)"
         )
         if filename:
-            self.input_path_line.setText(filename)
-            self.current_parser = HikvisionParser(filename)
-            self.btn_parse.setEnabled(True)
-            self.status_bar.showMessage(f"Input file set: {filename}")
-            
+            self._set_input(filename)
+
+    def select_device(self):
+        """Opens the device selection dialog populated by lsblk."""
+        dlg = DeviceSelectDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.selected_device:
+            self._set_input(dlg.selected_device)
+
     def select_output_directory(self):
         """Opens a directory dialog for the output folder."""
         directory = QFileDialog.getExistingDirectory(
-            self, 
-            "Select Output Directory", 
+            self,
+            "Select Output Directory",
             QDir.homePath()
         )
         if directory:
             self.output_path_line.setText(directory)
+            QSettings("hikextractor", "gui").setValue("output_dir", directory)
             self.status_bar.showMessage(f"Output folder set: {directory}")
 
     def start_parsing(self):
         """Starts the metadata parsing process in a worker thread."""
-        input_path = self.input_path_line.text()
-        if not os.path.exists(input_path):
-            QMessageBox.critical(self, "Error", "Input file not found.")
+        input_path = self.input_path_line.text().strip()
+        if not input_path:
+            QMessageBox.critical(self, "Error", "No input path specified.")
             return
+        if not os.path.exists(input_path):
+            QMessageBox.critical(self, "Error", f"Not found: {input_path}")
+            return
+        st = os.stat(input_path)
+        if not (stat.S_ISREG(st.st_mode) or stat.S_ISBLK(st.st_mode)):
+            QMessageBox.critical(self, "Error", "Input must be a regular file or block device.")
+            return
+        if not os.access(input_path, os.R_OK):
+            if stat.S_ISBLK(os.stat(input_path).st_mode):
+                self._prompt_escalate(input_path)
+                if not os.access(input_path, os.R_OK):
+                    return  # User cancelled or grant failed
+            else:
+                QMessageBox.critical(self, "Permission Denied", f"Cannot read: {input_path}")
+                return
+        # Reinitialise parser in case path was typed manually
+        self.current_parser = HikvisionParser(input_path)
 
         self.btn_parse.setEnabled(False)
         self.btn_export_selected.setEnabled(False)
@@ -376,7 +529,7 @@ class MainWindow(QMainWindow):
                 color: #cccccc;
             }
             QPushButton {
-                background-color: #4CAF50; /* Green */
+                background-color: #4CAF50;
                 color: white;
                 border: 1px solid #388E3C;
                 padding: 8px 15px;
@@ -388,6 +541,20 @@ class MainWindow(QMainWindow):
             QPushButton:disabled {
                 background-color: #555555;
                 color: #999999;
+            }
+            QPushButton#btn_file {
+                background-color: #5a5a5a;
+                border: 1px solid #444444;
+            }
+            QPushButton#btn_file:hover {
+                background-color: #6a6a6a;
+            }
+            QPushButton#btn_device {
+                background-color: #1a6eb5;
+                border: 1px solid #144f80;
+            }
+            QPushButton#btn_device:hover {
+                background-color: #1e80d0;
             }
             QLineEdit {
                 background-color: #3e3e3e;
