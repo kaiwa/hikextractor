@@ -1,4 +1,4 @@
-import os, subprocess, tempfile, shutil, mmap, struct, sys, argparse, dataclasses
+import os, subprocess, tempfile, shutil, mmap, struct, sys, argparse, dataclasses, stat
 from datetime import datetime, timezone
 from typing import List, Optional
 
@@ -651,7 +651,7 @@ if __name__ == "__main__":
         "--input",
         dest="input",
         required=True,
-        help="Raw image file from the DVR HD",
+        help="Raw image file or block device path (e.g. /dev/sdb). Reading a device may require root privileges.",
     )
     parser.add_argument("-o", "--output", dest="output", required=False, default=None, help="Output directory")
     parser.add_argument(
@@ -694,7 +694,14 @@ if __name__ == "__main__":
     source = args.input
     dest_folder = args.output
     if not os.path.exists(source):
-        print(f"File not found: {source}", file=sys.stderr)
+        print(f"Not found: {source}", file=sys.stderr)
+        exit(1)
+    st = os.stat(source)
+    if not (stat.S_ISREG(st.st_mode) or stat.S_ISBLK(st.st_mode)):
+        print(f"Input must be a regular file or block device: {source}", file=sys.stderr)
+        exit(1)
+    if not os.access(source, os.R_OK):
+        print(f"Permission denied: {source} (try running with sudo)", file=sys.stderr)
         exit(1)
     if args.master_only:
         export_all_videos(source, None, list_only=False, master_only=True)
