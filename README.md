@@ -1,4 +1,4 @@
-<img width="1002" height="732" alt="{C24665C8-202E-4A47-A3FF-ABE22AA1BF85}" src="https://github.com/user-attachments/assets/07d83f44-78d1-4110-84ed-1f4e250d7833" />
+![hikextractor GUI](doc/screenshot.png)
 
 # hikextractor-gui
 
