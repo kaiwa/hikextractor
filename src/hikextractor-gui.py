@@ -541,10 +541,26 @@ class MainWindow(QMainWindow):
         # 2. Populate the table
         self.table_segments.setRowCount(len(entry_list))
 
+        # Assign alternating background colors per calendar day
+        DAY_COLORS = [QBrush(QColor("#3e3e3e")), QBrush(QColor("#4c4c4c"))]
+        row_brushes: list[QBrush] = []
+        prev_date = None
+        day_index = -1
+        for entry in entry_list:
+            current_date = entry.start_timestamp.date() if entry.start_timestamp else None
+            if current_date != prev_date:
+                day_index += 1
+                prev_date = current_date
+            row_brushes.append(DAY_COLORS[day_index % 2])
+
         block_size = master.size_data_block
         for row, entry in enumerate(entry_list):
+            brush = row_brushes[row]
+
             def _item(text=""):
-                return QTableWidgetItem(text)
+                it = QTableWidgetItem(text)
+                it.setBackground(brush)
+                return it
 
             # Preview placeholder (thumbnail filled in asynchronously)
             preview_item = _item()
