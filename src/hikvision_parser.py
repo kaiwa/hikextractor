@@ -238,6 +238,95 @@ def rename_file_if_exists(filename: str) -> str:
     return new_filename
 
 
+def export_file_with_audio(datablock: bytes, filename: str):
+    """Exports video with audio by extracting and processing G.711 audio from Hikvision MPEG-PS stream."""
+    import tempfile
+    import struct
+
+    # Step 1: Save MPEG-PS stream to temp file
+    temp_mpeg = tempfile.NamedTemporaryFile(suffix='.mpg', delete=False)
+    temp_audio_raw = tempfile.NamedTemporaryFile(suffix='.pcm', delete=False)
+
+    try:
+        # Write MPEG-PS data to temp file
+        export_footage_from_block(datablock, temp_mpeg)
+        temp_mpeg.close()
+
+        # Step 2: Manually extract G.711 audio payload from MPEG-PS packets
+        with open(temp_mpeg.name, 'rb') as f:
+            ps_data = f.read()
+
+        audio_payloads = []
+        pos = 0
+        while pos < len(ps_data) - 10:
+            if ps_data[pos:pos+4] == b'\x00\x00\x01\xC0':  # Audio stream 0
+                packet_length = struct.unpack('>H', ps_data[pos+4:pos+6])[0]
+                if pos + 8 < len(ps_data):
+                    pes_header_len = ps_data[pos+8]
+                    payload_start = pos + 9 + pes_header_len
+                    payload_end = pos + 6 + packet_length
+
+                    if payload_end <= len(ps_data) and payload_start < payload_end:
+                        audio_payloads.append(ps_data[payload_start:payload_end])
+                pos += 4
+            else:
+                pos += 1
+
+        # Step 4: Write raw audio to file
+        with open(temp_audio_raw.name, 'wb') as f:
+            for payload in audio_payloads:
+                f.write(payload)
+
+        # Step 3: Remux MPEG-PS with extracted G.711 audio
+        successful_codec = None
+        for audio_codec in ['mulaw', 'alaw']:
+            result = subprocess.run([
+                "ffmpeg",
+                "-i", temp_mpeg.name,
+                "-f", audio_codec, "-ar", "8000", "-ac", "1", "-i", temp_audio_raw.name,
+                "-c:v", "copy",
+                "-c:a", "aac", "-b:a", "64k",
+                "-shortest",
+                "-loglevel", "error",
+                "-y", filename
+            ], capture_output=True)
+
+            # Check if audio stream is in output
+            check = subprocess.run([
+                "ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_type",
+                "-of", "default=noprint_wrappers=1:nokey=1", filename
+            ], capture_output=True, text=True)
+
+            has_audio = 'audio' in check.stdout
+
+            if os.path.exists(filename) and os.path.getsize(filename) > 0 and has_audio:
+                successful_codec = audio_codec
+                print(f"Audio decoded successfully as G.711 {audio_codec} and muxed with video")
+                break
+            else:
+                if not has_audio and result.stderr:
+                    print(f"  {audio_codec} failed: {result.stderr.decode('utf-8', errors='ignore')[:200]}")
+                if os.path.exists(filename):
+                    os.remove(filename)
+
+        # Check result
+        if os.path.exists(filename) and os.path.getsize(filename) > 0:
+            file_size = os.path.getsize(filename) / (1024 * 1024)
+            print(f"Successfully created MP4 with audio: {os.path.basename(filename)} ({file_size:.2f} MB)")
+            return True
+        else:
+            print(f"Failed to create MP4 with audio. stderr: {result.stderr.decode('utf-8', errors='ignore')}")
+            return False
+
+    finally:
+        # Clean up temp files
+        for temp_file in [temp_mpeg, temp_audio_raw]:
+            try:
+                os.unlink(temp_file.name)
+            except:
+                pass
+
+
 def export_file(datablock: bytes, filename: str, raw: bool):
     """Handles piping raw data to FFmpeg or saving raw stream."""
     if not raw:
@@ -247,25 +336,51 @@ def export_file(datablock: bytes, filename: str, raw: bool):
         except (FileNotFoundError, subprocess.CalledProcessError):
             print("FFmpeg not found or not working. Exporting as raw H.264 instead.")
             raw = True
-        
+
     if not raw:
-        # FFmpeg remuxing
+        # Try to export with audio first
+        print("Attempting to export with audio (G.711 decoding)...")
+        if export_file_with_audio(datablock, filename):
+            return
+
+        # If audio export fails, fall back to video-only
+        print("Audio export failed, falling back to video-only MP4...")
         process = subprocess.Popen(
             [
                 "ffmpeg",
                 "-err_detect", "ignore_err",
                 "-i", "-",
                 "-c:v", "copy",
+                "-an",  # Skip audio
                 "-bsf:v", "filter_units=pass_types=1-5",
                 "-aspect", "4/3",
-                "-loglevel", "error",
+                "-loglevel", "warning",
                 "-stats",
+                "-y",
                 filename,
             ],
             stdin=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdout=subprocess.PIPE,
         )
         export_footage_from_block(datablock, process.stdin)
-        process.communicate()
+        stdout, stderr = process.communicate()
+
+        if not os.path.exists(filename) or os.path.getsize(filename) == 0:
+            stderr_output = stderr.decode('utf-8', errors='ignore')
+            print(f"Warning: FFmpeg failed to create MP4. stderr: {stderr_output}")
+            print("Falling back to raw H.264 export...")
+
+            if os.path.exists(filename):
+                os.remove(filename)
+
+            raw_filename = filename.rsplit('.', 1)[0] + '.h264'
+            with open(raw_filename, 'wb') as out:
+                export_footage_from_block(datablock, out)
+            print(f"Exported as raw H.264: {raw_filename}")
+        else:
+            file_size = os.path.getsize(filename) / (1024 * 1024)
+            print(f"Successfully created video-only MP4: {os.path.basename(filename)} ({file_size:.2f} MB)")
     else:
         # Raw H.264 export
         with open(filename,'wb') as out:
