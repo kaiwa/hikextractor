@@ -282,11 +282,11 @@ def export_file_with_audio(datablock: bytes, filename: str):
         for audio_codec in ['mulaw', 'alaw']:
             result = subprocess.run([
                 "ffmpeg",
-                "-i", temp_mpeg.name,
-                "-f", audio_codec, "-ar", "8000", "-ac", "1", "-i", temp_audio_raw.name,
-                "-c:v", "copy",
-                "-c:a", "aac", "-b:a", "64k",
-                "-shortest",
+                "-i", temp_mpeg.name,  # MPEG-PS with video (has timestamps!)
+                "-f", audio_codec, "-ar", "8000", "-ac", "1", "-i", temp_audio_raw.name,  # Audio input
+                "-c:v", "copy",  # Copy video as-is
+                "-c:a", "aac", "-b:a", "64k",  # Encode audio to AAC
+                "-shortest",  # End when shortest stream ends
                 "-loglevel", "error",
                 "-y", filename
             ], capture_output=True)
@@ -404,7 +404,8 @@ class HikvisionParser:
         if not (stat.S_ISREG(st.st_mode) or stat.S_ISBLK(st.st_mode)):
             raise ValueError(f"Input must be a regular file or block device: {self.source_path}")
 
-        is_device = stat.S_ISBLK(os.stat(self.source_path).st_mode)
+        st = os.stat(self.source_path)
+        is_device = stat.S_ISBLK(st.st_mode)
 
         if is_device:
             # Use pread-based reader to avoid SIGBUS on block devices

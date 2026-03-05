@@ -2,8 +2,8 @@ import sys
 import os
 import stat
 import subprocess
-import tempfile
 import traceback
+import tempfile
 from typing import Optional, Set
 
 from PyQt6.QtWidgets import (
@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
     QStyledItemDelegate, QComboBox,
 )
 from PyQt6.QtCore import (
-    Qt, QObject, QRunnable, QThreadPool, pyqtSignal, QDir, QSettings, QSize,
+    Qt, QObject, QRunnable, QThreadPool, pyqtSignal, QDir, QSize, QSettings,
 )
 from PyQt6.QtGui import QFont, QIcon, QPixmap, QPainter, QPen, QColor, QBrush
 
