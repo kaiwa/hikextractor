@@ -1,3 +1,4 @@
+import errno
 import mmap
 import struct
 import subprocess
@@ -462,19 +463,29 @@ class HikvisionParser:
 
         st = os.stat(self.source_path)
         if stat.S_ISBLK(st.st_mode):
-            # Read in 4 MB chunks from block device
-            CHUNK = 4 * 1024 * 1024
+            # Read in 4 MB chunks from block device, retrying with smaller
+            # chunks on I/O errors (e.g. bad sectors) down to one sector.
+            MAX_CHUNK = 4 * 1024 * 1024
+            MIN_CHUNK = 512
             fd = os.open(self.source_path, os.O_RDONLY)
             try:
                 parts = []
                 done = 0
+                chunk_size = MAX_CHUNK
                 while done < block_size:
-                    to_read = min(CHUNK, block_size - done)
-                    chunk = os.pread(fd, to_read, start_offset + done)
+                    to_read = min(chunk_size, block_size - done)
+                    try:
+                        chunk = os.pread(fd, to_read, start_offset + done)
+                    except OSError as e:
+                        if e.errno == errno.EIO and chunk_size > MIN_CHUNK:
+                            chunk_size = max(chunk_size // 2, MIN_CHUNK)
+                            continue  # retry same position with smaller chunk
+                        raise
                     if not chunk:
                         break
                     parts.append(chunk)
                     done += len(chunk)
+                    chunk_size = min(chunk_size * 2, MAX_CHUNK)  # recover after success
                     if on_progress:
                         on_progress(done, block_size)
                 datablock = b"".join(parts)
