@@ -4,6 +4,7 @@ import stat
 import subprocess
 import traceback
 import tempfile
+from datetime import datetime
 from typing import Optional, Set
 
 from PyQt6.QtWidgets import (
@@ -82,6 +83,7 @@ class WorkerSignals(QObject):
     result_metadata = pyqtSignal(MasterBlock, list)  # MasterBlock + HIKBTREEEntries
     export_started = pyqtSignal(int)                  # Total items to export
     export_progress = pyqtSignal(int, str)            # Current item index, filename
+    export_skipped = pyqtSignal(int)                  # Number of segments skipped due to I/O errors
     error = pyqtSignal(tuple)                         # (exc_type, exc_value, traceback_str)
     finished = pyqtSignal()                           # No data
 
@@ -116,6 +118,7 @@ class ParserWorker(QRunnable):
                 self.signals.export_started.emit(total_mb)
 
                 completed_bytes = 0
+                io_errors = 0
                 for i, entry in enumerate(self.entry_list):
                     ch = f"CH-{entry.channel:02d}"
 
@@ -143,14 +146,24 @@ class ParserWorker(QRunnable):
                                 f"Converting {_ch} ({_i+1}/{total_entries})…"
                             )
 
-                    filename = self.parser.export_video_block(
-                        entry, self.dest_folder, self.raw, on_progress=on_progress
-                    )
+                    try:
+                        filename = self.parser.export_video_block(
+                            entry, self.dest_folder, self.raw, on_progress=on_progress
+                        )
+                    except OSError as e:
+                        io_errors += 1
+                        completed_bytes += block_size
+                        self.signals.export_progress.emit(
+                            completed_bytes // (1024 * 1024),
+                            f"Skipped {ch} ({i+1}/{total_entries}): I/O error — {e}"
+                        )
+                        continue
                     completed_bytes += block_size
                     self.signals.export_progress.emit(
                         completed_bytes // (1024 * 1024),
                         f"Done ({i+1}/{total_entries}): {os.path.basename(filename)}"
                     )
+                self.signals.export_skipped.emit(io_errors)
 
         except Exception as e:
             # Catch any exception and emit it to the main thread
@@ -188,7 +201,7 @@ class DayBorderDelegate(QStyledItemDelegate):
 
 # --- 4. Thumbnail worker ---
 class ThumbnailSignals(QObject):
-    ready = pyqtSignal(int, QPixmap)   # row, thumbnail pixmap
+    ready = pyqtSignal(int, QPixmap)   # offset_datablock, thumbnail pixmap
 
 
 class ThumbnailWorker(QRunnable):
@@ -196,9 +209,8 @@ class ThumbnailWorker(QRunnable):
 
     READ_SIZE = 4 * 1024 * 1024  # First 4 MB is enough to hit an I-frame
 
-    def __init__(self, row: int, source_path: str, entry: HIKBTREEEntry, block_size: int):
+    def __init__(self, source_path: str, entry: HIKBTREEEntry, block_size: int):
         super().__init__()
-        self.row = row
         self.source_path = source_path
         self.entry = entry
         self.block_size = block_size
@@ -248,7 +260,7 @@ class ThumbnailWorker(QRunnable):
                 if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
                     pixmap = QPixmap(tmp_path)
                     if not pixmap.isNull():
-                        self.signals.ready.emit(self.row, pixmap)
+                        self.signals.ready.emit(self.entry.offset_datablock, pixmap)
             except Exception:
                 pass
             finally:
@@ -274,6 +286,9 @@ class MainWindow(QMainWindow):
         self._elevated_devices: list[str] = []  # devices we chmod'd; restored on close
         self._delegate = DayBorderDelegate(self)
         self._thumb_cache: dict[tuple, QPixmap] = {}
+        self._all_entries: list = []
+        self._sort_col: int = 2          # default: start time
+        self._sort_asc: bool = True
 
         self._setup_ui()
         self._apply_style()
@@ -357,6 +372,8 @@ class MainWindow(QMainWindow):
         self.table_segments.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
         self.table_segments.verticalHeader().setVisible(False)
         self.table_segments.setItemDelegate(self._delegate)
+        hdr.setSectionsClickable(True)
+        hdr.sectionClicked.connect(self._on_header_clicked)
 
         # --- C2. Channel filter bar ---
         filter_layout = QHBoxLayout()
@@ -538,41 +555,93 @@ class MainWindow(QMainWindow):
         )
         self.metadata_label.setText(metadata_text)
 
-        # 2. Populate the table
-        self.table_segments.setRowCount(len(entry_list))
+        # 2. Store entries and populate the table
+        self._all_entries = list(entry_list)
+        self._sort_col = 2
+        self._sort_asc = True
+        self._populate_table(self._all_entries)
+
+        # 3. Populate channel filter (block signals to avoid triggering filter during rebuild)
+        self.combo_channel_filter.blockSignals(True)
+        self.combo_channel_filter.clear()
+        self.combo_channel_filter.addItem("All channels")
+        for ch in sorted({e.channel for e in entry_list}):
+            self.combo_channel_filter.addItem(f"Channel {ch:02d}", userData=ch)
+        self.combo_channel_filter.blockSignals(False)
+
+        self.status_bar.showMessage(f"Parsing complete. Found {len(entry_list)} video segments.")
+        self.btn_export_selected.setEnabled(True)
+
+    def _sorted_entries(self, col: int, ascending: bool) -> list:
+        """Return _all_entries sorted by the given column with secondary sort by date."""
+        _min = datetime.min
+        if col == 1:  # Channel → secondary sort by start time
+            key = lambda e: (e.channel, e.start_timestamp or _min)
+        elif col == 2:  # Start time
+            key = lambda e: e.start_timestamp or _min
+        elif col == 3:  # End time
+            key = lambda e: e.end_timestamp or _min
+        else:
+            return list(self._all_entries)
+        return sorted(self._all_entries, key=key, reverse=not ascending)
+
+    def _on_header_clicked(self, col: int):
+        """Sort the table by the clicked column; toggle direction on repeated clicks."""
+        if col == 0 or not self._all_entries:  # Preview column — not sortable
+            return
+        if col == self._sort_col:
+            self._sort_asc = not self._sort_asc
+        else:
+            self._sort_col = col
+            self._sort_asc = True
+        self._populate_table(self._sorted_entries(self._sort_col, self._sort_asc))
+        # Update sort indicator
+        hdr = self.table_segments.horizontalHeader()
+        hdr.setSortIndicatorShown(True)
+        hdr.setSortIndicator(
+            self._sort_col,
+            Qt.SortOrder.AscendingOrder if self._sort_asc else Qt.SortOrder.DescendingOrder,
+        )
+
+    def _populate_table(self, entries: list):
+        """Fill the segment table with the given (pre-sorted) entry list."""
+        block_size = self.current_parser.master_block.size_data_block
 
         # Assign alternating background colors per calendar day
         DAY_COLORS = [QBrush(QColor("#3e3e3e")), QBrush(QColor("#4c4c4c"))]
         row_brushes: list[QBrush] = []
         prev_date = None
         day_index = -1
-        for entry in entry_list:
+        for entry in entries:
             current_date = entry.start_timestamp.date() if entry.start_timestamp else None
             if current_date != prev_date:
                 day_index += 1
                 prev_date = current_date
             row_brushes.append(DAY_COLORS[day_index % 2])
 
-        block_size = master.size_data_block
-        for row, entry in enumerate(entry_list):
+        self.table_segments.setRowCount(len(entries))
+        for row, entry in enumerate(entries):
             brush = row_brushes[row]
 
-            def _item(text=""):
+            def _item(text="", _brush=brush):
                 it = QTableWidgetItem(text)
-                it.setBackground(brush)
+                it.setBackground(_brush)
+                it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 return it
 
             # Preview placeholder (thumbnail filled in asynchronously)
             preview_item = _item()
-            preview_item.setFlags(preview_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.table_segments.setItem(row, 0, preview_item)
 
             ch_item = QTableWidgetItem(f"{entry.channel:02d}")
             ch_item.setBackground(_channel_brush(entry.channel))
+            ch_item.setFlags(ch_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.table_segments.setItem(row, 1, ch_item)
 
             start_time = f"{entry.start_timestamp:%Y-%m-%d %H:%M:%S}" if entry.start_timestamp else "N/A"
-            self.table_segments.setItem(row, 2, _item(start_time))
+            start_item = _item(start_time)
+            start_item.setData(Qt.ItemDataRole.UserRole + 1, entry)  # entry reference for export
+            self.table_segments.setItem(row, 2, start_item)
 
             end_time = f"{entry.end_timestamp:%Y-%m-%d %H:%M:%S}" if entry.end_timestamp else "N/A"
             self.table_segments.setItem(row, 3, _item(end_time))
@@ -586,39 +655,34 @@ class MainWindow(QMainWindow):
                 if cache_key in self._thumb_cache:
                     preview_item.setData(Qt.ItemDataRole.UserRole, self._thumb_cache[cache_key])
                 else:
-                    worker = ThumbnailWorker(row, self.current_parser.source_path, entry, block_size)
+                    worker = ThumbnailWorker(self.current_parser.source_path, entry, block_size)
                     worker.signals.ready.connect(self._on_thumbnail_ready)
                     self.thumb_pool.start(worker)
 
         self.table_segments.resizeColumnsToContents()
         self.table_segments.setColumnWidth(0, 170)  # keep preview column fixed after resize
 
-        # Populate channel filter (block signals to avoid triggering filter during rebuild)
-        self.combo_channel_filter.blockSignals(True)
-        self.combo_channel_filter.clear()
-        self.combo_channel_filter.addItem("All channels")
-        for ch in sorted({e.channel for e in entry_list}):
-            self.combo_channel_filter.addItem(f"Channel {ch:02d}", userData=ch)
-        self.combo_channel_filter.blockSignals(False)
-
-        self.status_bar.showMessage(f"Parsing complete. Found {len(entry_list)} video segments.")
-        self.btn_export_selected.setEnabled(True)
-
-    def _on_thumbnail_ready(self, row: int, pixmap: QPixmap):
+    def _on_thumbnail_ready(self, offset: int, pixmap: QPixmap):
         """Slot: stores the thumbnail pixmap on the preview cell and populates the cache."""
-        item = self.table_segments.item(row, 0)
-        if item:
-            item.setData(Qt.ItemDataRole.UserRole, pixmap)
-        if self.current_parser and row < len(self.current_parser.entry_list):
-            entry = self.current_parser.entry_list[row]
-            self._thumb_cache[(self.current_parser.source_path, entry.offset_datablock)] = pixmap
+        for row in range(self.table_segments.rowCount()):
+            item = self.table_segments.item(row, 2)
+            if item:
+                entry = item.data(Qt.ItemDataRole.UserRole + 1)
+                if entry and entry.offset_datablock == offset:
+                    preview = self.table_segments.item(row, 0)
+                    if preview:
+                        preview.setData(Qt.ItemDataRole.UserRole, pixmap)
+                    if self.current_parser:
+                        self._thumb_cache[(self.current_parser.source_path, offset)] = pixmap
+                    break
 
     def _apply_channel_filter(self):
         """Show only rows matching the selected channel (or all rows)."""
         selected_ch = self.combo_channel_filter.currentData()  # None for "All channels"
-        entry_list = self.current_parser.entry_list if self.current_parser else []
-        for row, entry in enumerate(entry_list):
-            hide = selected_ch is not None and entry.channel != selected_ch
+        for row in range(self.table_segments.rowCount()):
+            item = self.table_segments.item(row, 2)
+            entry = item.data(Qt.ItemDataRole.UserRole + 1) if item else None
+            hide = selected_ch is not None and (entry is None or entry.channel != selected_ch)
             self.table_segments.setRowHidden(row, hide)
 
     def start_export_selected(self):
@@ -637,9 +701,15 @@ class MainWindow(QMainWindow):
         if not selected_rows:
             QMessageBox.warning(self, "Warning", "Please select at least one video segment to export.")
             return
-            
-        # Build the list of selected entries
-        export_list = [self.current_parser.entry_list[row] for row in selected_rows]
+
+        # Build the list of selected entries (read from table — order may differ from entry_list)
+        export_list = []
+        for row in selected_rows:
+            item = self.table_segments.item(row, 2)
+            if item:
+                entry = item.data(Qt.ItemDataRole.UserRole + 1)
+                if entry:
+                    export_list.append(entry)
         
         self.btn_export_selected.setEnabled(False)
         self.btn_parse.setEnabled(False)
@@ -647,8 +717,10 @@ class MainWindow(QMainWindow):
         
         # Start export worker
         worker = ParserWorker(self.current_parser, dest_folder, self.checkbox_raw.isChecked(), export_list)
+        self._export_io_errors = 0
         worker.signals.export_started.connect(self.export_started)
         worker.signals.export_progress.connect(self.export_progress)
+        worker.signals.export_skipped.connect(self._on_export_skipped)
         worker.signals.error.connect(self.worker_error)
         worker.signals.finished.connect(self.worker_finished)
         self.threadpool.start(worker)
@@ -687,8 +759,12 @@ class MainWindow(QMainWindow):
         if "Starting metadata parsing" in self.status_bar.currentMessage():
             self.status_bar.showMessage("Metadata Parsing Complete.", 5000)
         elif "Starting export" in self.status_bar.currentMessage():
-            self.status_bar.showMessage("Export Complete.", 5000)
+            n = getattr(self, "_export_io_errors", 0)
+            suffix = f"  ({n} segment{'s' if n != 1 else ''} skipped due to I/O errors)" if n else ""
+            self.status_bar.showMessage(f"Export Complete.{suffix}", 8000)
 
+    def _on_export_skipped(self, count: int):
+        self._export_io_errors = count
 
     # --- Modern Styling (QSS) ---
     def _apply_style(self):
