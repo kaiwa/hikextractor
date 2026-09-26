@@ -3,7 +3,6 @@ import os
 import stat
 import subprocess
 import traceback
-import tempfile
 from datetime import datetime
 from typing import Optional, Set
 
@@ -17,7 +16,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import (
     Qt, QObject, QRunnable, QThreadPool, pyqtSignal, QDir, QSize, QSettings,
 )
-from PyQt6.QtGui import QFont, QIcon, QPixmap, QPainter, QPen, QColor, QBrush
+from PyQt6.QtGui import QFont, QIcon, QPixmap, QImage, QPainter, QPen, QColor, QBrush
 
 # Import your forensic logic from the other file
 try:
@@ -201,7 +200,10 @@ class DayBorderDelegate(QStyledItemDelegate):
 
 # --- 4. Thumbnail worker ---
 class ThumbnailSignals(QObject):
-    ready = pyqtSignal(int, QPixmap)   # offset_datablock, thumbnail pixmap
+    # offset_datablock (object: offsets exceed 32-bit int), thumbnail image.
+    # QImage rather than QPixmap: QPixmap must only be created in the GUI thread.
+    ready = pyqtSignal(object, QImage)
+    done = pyqtSignal(object)          # offset_datablock, emitted on success and failure
 
 
 class ThumbnailWorker(QRunnable):
@@ -217,59 +219,63 @@ class ThumbnailWorker(QRunnable):
         self.signals = ThumbnailSignals()
 
     def run(self):
+        offset = self.entry.offset_datablock
         try:
-            read_size = min(self.READ_SIZE, self.block_size)
-            start = self.entry.offset_datablock
-
-            st = os.stat(self.source_path)
-            if stat.S_ISBLK(st.st_mode):
-                fd = os.open(self.source_path, os.O_RDONLY)
-                try:
-                    data = os.pread(fd, read_size, start)
-                finally:
-                    os.close(fd)
-            else:
-                with open(self.source_path, "rb") as f:
-                    f.seek(start)
-                    data = f.read(read_size)
-
-            # Locate MPEG-PS pack start code
-            nal_pos = data.find(b"\x00\x00\x01\xba")
-            if nal_pos < 0:
-                return
-            data = data[nal_pos:]
-
-            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".jpg")
-            os.close(tmp_fd)
-            try:
-                proc = subprocess.Popen(
-                    [
-                        "ffmpeg",
-                        "-err_detect", "ignore_err",
-                        "-i", "pipe:0",
-                        "-frames:v", "1",
-                        "-vf", "scale=160:-1",
-                        "-loglevel", "error",
-                        "-y", tmp_path,
-                    ],
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
-                proc.communicate(input=data, timeout=15)
-                if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
-                    pixmap = QPixmap(tmp_path)
-                    if not pixmap.isNull():
-                        self.signals.ready.emit(self.entry.offset_datablock, pixmap)
-            except Exception:
-                pass
-            finally:
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
+            image = self._extract()
+            if image is not None:
+                self.signals.ready.emit(offset, image)
         except Exception:
             pass
+        finally:
+            self.signals.done.emit(offset)
+
+    def _extract(self) -> Optional[QImage]:
+        read_size = min(self.READ_SIZE, self.block_size)
+        start = self.entry.offset_datablock
+
+        st = os.stat(self.source_path)
+        if stat.S_ISBLK(st.st_mode):
+            fd = os.open(self.source_path, os.O_RDONLY)
+            try:
+                data = os.pread(fd, read_size, start)
+            finally:
+                os.close(fd)
+        else:
+            with open(self.source_path, "rb") as f:
+                f.seek(start)
+                data = f.read(read_size)
+
+        # Locate MPEG-PS pack start code
+        nal_pos = data.find(b"\x00\x00\x01\xba")
+        if nal_pos < 0:
+            return None
+        data = data[nal_pos:]
+
+        # Decode only keyframes and write the JPEG to stdout (no temp file)
+        proc = subprocess.run(
+            [
+                "ffmpeg",
+                "-loglevel", "error",
+                "-nostdin",
+                "-threads", "1",  # several run in parallel; don't let each grab every core
+                "-err_detect", "ignore_err",
+                "-skip_frame", "nokey",
+                "-f", "mpeg",
+                "-i", "pipe:0",
+                "-frames:v", "1",
+                "-vf", "scale=160:-1",
+                "-f", "image2pipe", "-c:v", "mjpeg",
+                "pipe:1",
+            ],
+            input=data,
+            capture_output=True,
+            timeout=15,
+            preexec_fn=lambda: os.nice(19),
+        )
+        if not proc.stdout:
+            return None
+        image = QImage.fromData(proc.stdout, "JPG")
+        return None if image.isNull() else image
 
 
 # --- 5. Main GUI Window ---
@@ -281,11 +287,13 @@ class MainWindow(QMainWindow):
 
         self.threadpool = QThreadPool()
         self.thumb_pool = QThreadPool()
-        self.thumb_pool.setMaxThreadCount(2)
+        self.thumb_pool.setMaxThreadCount(max(2, min(6, (os.cpu_count() or 2) // 2)))
         self.current_parser: Optional[HikvisionParser] = None
         self._elevated_devices: list[str] = []  # devices we chmod'd; restored on close
         self._delegate = DayBorderDelegate(self)
         self._thumb_cache: dict[tuple, QPixmap] = {}
+        self._thumb_pending: set[tuple] = set()   # thumbnails queued or running
+        self._row_by_offset: dict[int, int] = {}  # offset_datablock -> table row
         self._all_entries: list = []
         self._sort_col: int = 2          # default: start time
         self._sort_asc: bool = True
@@ -532,7 +540,10 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)  # Indeterminate mode
         
-        # Reset table and metadata display
+        # Reset table and metadata display; drop thumbnail jobs not yet started
+        self.thumb_pool.clear()
+        self._thumb_pending.clear()
+        self._row_by_offset.clear()
         self.table_segments.setRowCount(0)
         self.metadata_label.setText("Parsing...")
         
@@ -620,7 +631,9 @@ class MainWindow(QMainWindow):
             row_brushes.append(DAY_COLORS[day_index % 2])
 
         self.table_segments.setRowCount(len(entries))
+        self._row_by_offset = {}
         for row, entry in enumerate(entries):
+            self._row_by_offset[entry.offset_datablock] = row
             brush = row_brushes[row]
 
             def _item(text="", _brush=brush):
@@ -654,27 +667,32 @@ class MainWindow(QMainWindow):
                 cache_key = (self.current_parser.source_path, entry.offset_datablock)
                 if cache_key in self._thumb_cache:
                     preview_item.setData(Qt.ItemDataRole.UserRole, self._thumb_cache[cache_key])
-                else:
+                elif cache_key not in self._thumb_pending:  # re-sorting must not re-queue
+                    self._thumb_pending.add(cache_key)
                     worker = ThumbnailWorker(self.current_parser.source_path, entry, block_size)
                     worker.signals.ready.connect(self._on_thumbnail_ready)
+                    worker.signals.done.connect(self._on_thumbnail_done)
                     self.thumb_pool.start(worker)
 
         self.table_segments.resizeColumnsToContents()
         self.table_segments.setColumnWidth(0, 170)  # keep preview column fixed after resize
 
-    def _on_thumbnail_ready(self, offset: int, pixmap: QPixmap):
+    def _on_thumbnail_ready(self, offset: int, image: QImage):
         """Slot: stores the thumbnail pixmap on the preview cell and populates the cache."""
-        for row in range(self.table_segments.rowCount()):
-            item = self.table_segments.item(row, 2)
-            if item:
-                entry = item.data(Qt.ItemDataRole.UserRole + 1)
-                if entry and entry.offset_datablock == offset:
-                    preview = self.table_segments.item(row, 0)
-                    if preview:
-                        preview.setData(Qt.ItemDataRole.UserRole, pixmap)
-                    if self.current_parser:
-                        self._thumb_cache[(self.current_parser.source_path, offset)] = pixmap
-                    break
+        if not self.current_parser:
+            return
+        pixmap = QPixmap.fromImage(image)
+        self._thumb_cache[(self.current_parser.source_path, offset)] = pixmap
+        row = self._row_by_offset.get(offset)
+        if row is not None:
+            preview = self.table_segments.item(row, 0)
+            if preview:
+                preview.setData(Qt.ItemDataRole.UserRole, pixmap)
+
+    def _on_thumbnail_done(self, offset: int):
+        """Slot: a thumbnail job finished (successfully or not)."""
+        if self.current_parser:
+            self._thumb_pending.discard((self.current_parser.source_path, offset))
 
     def _apply_channel_filter(self):
         """Show only rows matching the selected channel (or all rows)."""
