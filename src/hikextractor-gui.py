@@ -483,13 +483,16 @@ class MainWindow(QMainWindow):
 
     def select_input_file(self):
         """Opens a file dialog for a disk image."""
+        settings = QSettings("hikextractor", "gui")
+        start_dir = settings.value("input_dir", "")
         filename, _ = QFileDialog.getOpenFileName(
             self,
             "Open Hikvision Disk Image",
-            QDir.homePath(),
+            start_dir if start_dir and os.path.isdir(start_dir) else QDir.homePath(),
             "Raw Disk Images (*.dd *.img *.bin);;All Files (*)"
         )
         if filename:
+            settings.setValue("input_dir", os.path.dirname(filename))
             self._set_input(filename)
 
     def select_device(self):
@@ -500,10 +503,11 @@ class MainWindow(QMainWindow):
 
     def select_output_directory(self):
         """Opens a directory dialog for the output folder."""
+        saved_output = QSettings("hikextractor", "gui").value("output_dir", "")
         directory = QFileDialog.getExistingDirectory(
             self,
             "Select Output Directory",
-            QDir.homePath()
+            saved_output if saved_output and os.path.isdir(saved_output) else QDir.homePath()
         )
         if directory:
             self.output_path_line.setText(directory)
