@@ -10,13 +10,15 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLineEdit, QLabel, QFileDialog, QTableWidget,
     QTableWidgetItem, QHeaderView, QCheckBox, QProgressBar, QMessageBox,
-    QGridLayout, QSizePolicy, QDialog, QListWidget, QDialogButtonBox,
-    QStyledItemDelegate, QComboBox,
+    QGridLayout, QDialog, QListWidget, QDialogButtonBox,
+    QStyledItemDelegate, QComboBox, QStyle, QFrame,
 )
 from PyQt6.QtCore import (
-    Qt, QObject, QRunnable, QThreadPool, pyqtSignal, QDir, QSize, QSettings,
+    Qt, QObject, QRunnable, QThreadPool, pyqtSignal, QDir, QSize, QSettings, QRectF,
 )
-from PyQt6.QtGui import QFont, QIcon, QPixmap, QImage, QPainter, QPen, QColor, QBrush
+from PyQt6.QtGui import (
+    QIcon, QPixmap, QImage, QPainter, QPainterPath, QColor, QFontDatabase, QPalette,
+)
 
 # Import your forensic logic from the other file
 try:
@@ -171,31 +173,69 @@ class ParserWorker(QRunnable):
             self.signals.finished.emit()
 
 
-def _channel_brush(channel: int) -> QBrush:
-    """Returns a muted, dark-theme-friendly color unique to each channel number."""
-    hue = (channel * 53) % 360   # 53 is coprime with 360 → good spread
-    return QBrush(QColor.fromHsv(hue, 130, 130))
+_channel_dots: dict[int, QIcon] = {}
 
 
-# --- 3. Day-border delegate ---
+def _channel_dot(channel: int) -> QIcon:
+    """Returns a small colored dot, unique per channel, readable on light and dark themes."""
+    if channel not in _channel_dots:
+        hue = (channel * 53) % 360   # 53 is coprime with 360 → good spread
+        pixmap = QPixmap(24, 24)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pixmap)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor.fromHsv(hue, 170, 210))
+        p.drawEllipse(4, 4, 16, 16)
+        p.end()
+        _channel_dots[channel] = QIcon(pixmap)
+    return _channel_dots[channel]
+
+
+# Item data role holding the calendar-day parity (0/1) used for day banding
+DAY_ROLE = Qt.ItemDataRole.UserRole + 2
+
+
+# --- 3. Day-band delegate ---
 class DayBorderDelegate(QStyledItemDelegate):
-    """Paints thumbnails in col 0, scaled to fit the cell."""
+    """Shades alternate calendar days and paints rounded thumbnails in col 0."""
 
     def paint(self, painter: QPainter, option, index):
+        # Derived from the palette (not fixed colors) so the banding follows light/dark
+        # mode. AlternateBase can't be used: some themes (e.g. Adwaita dark) set it == Base.
+        if index.data(DAY_ROLE):
+            base = option.palette.color(QPalette.ColorRole.Base)
+            text = option.palette.color(QPalette.ColorRole.Text)
+            t = 0.06
+            band = QColor.fromRgbF(
+                base.redF() + (text.redF() - base.redF()) * t,
+                base.greenF() + (text.greenF() - base.greenF()) * t,
+                base.blueF() + (text.blueF() - base.blueF()) * t,
+            )
+            painter.fillRect(option.rect, band)
         super().paint(painter, option, index)
 
         if index.column() == 0:
             pixmap = index.data(Qt.ItemDataRole.UserRole)
             if isinstance(pixmap, QPixmap) and not pixmap.isNull():
-                target = option.rect.adjusted(2, 2, -2, -2)
+                target = option.rect.adjusted(4, 4, -4, -4)
+                dpr = painter.device().devicePixelRatioF()  # stay sharp on HiDPI screens
                 scaled = pixmap.scaled(
-                    target.size(),
+                    target.size() * dpr,
                     Qt.AspectRatioMode.KeepAspectRatio,
                     Qt.TransformationMode.SmoothTransformation,
                 )
-                x = target.x() + (target.width() - scaled.width()) // 2
-                y = target.y() + (target.height() - scaled.height()) // 2
-                painter.drawPixmap(x, y, scaled)
+                w = scaled.width() / dpr
+                h = scaled.height() / dpr
+                rect = QRectF(target.x() + (target.width() - w) / 2,
+                              target.y() + (target.height() - h) / 2, w, h)
+                clip = QPainterPath()
+                clip.addRoundedRect(rect, 4, 4)
+                painter.save()
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+                painter.setClipPath(clip)
+                painter.drawPixmap(rect, scaled, QRectF(scaled.rect()))
+                painter.restore()
 
 
 # --- 4. Thumbnail worker ---
@@ -278,11 +318,23 @@ class ThumbnailWorker(QRunnable):
         return None if image.isNull() else image
 
 
+def _theme_icon(name: str, fallback: QStyle.StandardPixmap) -> QIcon:
+    """Icon from the desktop icon theme, falling back to Qt's built-in one."""
+    return QIcon.fromTheme(name, QApplication.style().standardIcon(fallback))
+
+
+def _make_bold(widget: QWidget):
+    """Bold the widget's own (system) font instead of replacing the font family."""
+    font = widget.font()
+    font.setBold(True)
+    widget.setFont(font)
+
+
 # --- 5. Main GUI Window ---
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Hikvision DVR Forensic Extractor — Image & Device")
+        self.setWindowTitle("Hikvision DVR Forensic Extractor")
         self.setGeometry(100, 100, 1050, 720)
 
         self.threadpool = QThreadPool()
@@ -299,73 +351,74 @@ class MainWindow(QMainWindow):
         self._sort_asc: bool = True
 
         self._setup_ui()
-        self._apply_style()
 
     def _setup_ui(self):
         # Central Widget and Main Layout
         central_widget = QWidget()
         main_layout = QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(12, 12, 12, 6)
+        main_layout.setSpacing(10)
         self.setCentralWidget(central_widget)
 
         # --- A. Input Selection Widget ---
         input_group = QWidget()
         input_layout = QGridLayout(input_group)
         input_layout.setContentsMargins(0, 0, 0, 0)
-        
+
         self.input_path_line = QLineEdit()
         self.input_path_line.setPlaceholderText("Select a disk image or block device (e.g. /dev/sdb)")
+        self.input_path_line.setClearButtonEnabled(True)
         self.input_path_line.textChanged.connect(self._on_input_changed)
-        self.btn_open_file = QPushButton("Open Image")
-        self.btn_open_file.setObjectName("btn_file")
+        self.btn_open_file = QPushButton(
+            _theme_icon("document-open", QStyle.StandardPixmap.SP_DialogOpenButton), "Open Image…")
         self.btn_open_file.clicked.connect(self.select_input_file)
-        self.btn_open_device = QPushButton("Select Device")
-        self.btn_open_device.setObjectName("btn_device")
+        self.btn_open_device = QPushButton(
+            _theme_icon("drive-harddisk", QStyle.StandardPixmap.SP_DriveHDIcon), "Select Device…")
         self.btn_open_device.clicked.connect(self.select_device)
 
         self.output_path_line = QLineEdit()
         self.output_path_line.setReadOnly(True)
-        saved_output = QSettings("hikextractor", "gui").value("output_dir", "")
-        self.output_path_line.setText(saved_output if saved_output else "Select an output directory for videos")
-        self.btn_select_output = QPushButton("Select Output Folder")
+        self.output_path_line.setPlaceholderText("Select an output folder for videos")
+        self.output_path_line.setText(QSettings("hikextractor", "gui").value("output_dir", ""))
+        self.btn_select_output = QPushButton(
+            _theme_icon("folder", QStyle.StandardPixmap.SP_DirIcon), "Choose Folder…")
         self.btn_select_output.clicked.connect(self.select_output_directory)
 
-        self.btn_parse = QPushButton("1. PARSE METADATA")
+        self.btn_parse = QPushButton("Parse Metadata")
         self.btn_parse.clicked.connect(self.start_parsing)
-        self.btn_parse.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+        _make_bold(self.btn_parse)
         self.btn_parse.setEnabled(False)  # Enable after input is set
 
         # Layout for Input
         input_layout.addWidget(QLabel("Input:"), 0, 0)
         input_layout.addWidget(self.input_path_line, 0, 1)
         btn_open_layout = QHBoxLayout()
-        btn_open_layout.setSpacing(6)
         btn_open_layout.setContentsMargins(0, 0, 0, 0)
         btn_open_layout.addWidget(self.btn_open_file)
         btn_open_layout.addWidget(self.btn_open_device)
-        btn_open_container = QWidget()
-        btn_open_container.setLayout(btn_open_layout)
-        input_layout.addWidget(btn_open_container, 0, 2)
-        
-        input_layout.addWidget(QLabel("Output Folder:"), 1, 0)
+        input_layout.addLayout(btn_open_layout, 0, 2)
+
+        input_layout.addWidget(QLabel("Output folder:"), 1, 0)
         input_layout.addWidget(self.output_path_line, 1, 1)
         input_layout.addWidget(self.btn_select_output, 1, 2)
-        
-        input_layout.addWidget(self.btn_parse, 2, 0, 1, 3) # Span all columns
+
+        input_layout.addWidget(self.btn_parse, 2, 2)
 
         main_layout.addWidget(input_group)
-        
+
         # --- B. Metadata Display ---
         self.metadata_label = QLabel("Ready. Select a disk image file or a block device to begin.")
         self.metadata_label.setWordWrap(True)
-        self.metadata_label.setStyleSheet("padding: 10px; border: 1px dashed #555555;")
+        self.metadata_label.setFrameShape(QFrame.Shape.StyledPanel)
+        self.metadata_label.setMargin(8)
+        self.metadata_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         main_layout.addWidget(self.metadata_label)
-        main_layout.addSpacing(15)
 
         # --- C. Results Table (HIKBTREE Entries) ---
         self.table_segments = QTableWidget()
         self.table_segments.setColumnCount(6)
         self.table_segments.setHorizontalHeaderLabels(
-            ["Preview", "CH", "Start Time (UTC)", "End Time (UTC)", "Recording", "Data Offset"]
+            ["Preview", "Channel", "Start Time (UTC)", "End Time (UTC)", "Recording", "Data Offset"]
         )
         hdr = self.table_segments.horizontalHeader()
         hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
@@ -375,16 +428,23 @@ class MainWindow(QMainWindow):
         hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        hdr.setHighlightSections(False)
         self.table_segments.verticalHeader().setDefaultSectionSize(90)
         self.table_segments.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table_segments.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
         self.table_segments.verticalHeader().setVisible(False)
+        self.table_segments.setShowGrid(False)
+        self.table_segments.setWordWrap(False)
+        self.table_segments.setIconSize(QSize(12, 12))
+        self.table_segments.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table_segments.setItemDelegate(self._delegate)
         hdr.setSectionsClickable(True)
         hdr.sectionClicked.connect(self._on_header_clicked)
 
         # --- C2. Channel filter bar ---
         filter_layout = QHBoxLayout()
+        filter_layout.addWidget(QLabel("Show:"))
         self.combo_channel_filter = QComboBox()
         self.combo_channel_filter.addItem("All channels")
         self.combo_channel_filter.setMinimumWidth(160)
@@ -394,27 +454,29 @@ class MainWindow(QMainWindow):
         main_layout.addLayout(filter_layout)
 
         main_layout.addWidget(self.table_segments)
-        
-        # --- D. Export Controls & Progress ---
+
+        # --- D. Export Controls ---
         export_control_layout = QHBoxLayout()
-        
-        self.checkbox_raw = QCheckBox("Export as Raw H.264 (.h264)")
-        self.btn_export_selected = QPushButton("2. EXPORT SELECTED")
+
+        self.checkbox_raw = QCheckBox("Export as raw H.264 (.h264)")
+        self.btn_export_selected = QPushButton(
+            _theme_icon("document-save", QStyle.StandardPixmap.SP_DialogSaveButton), "Export Selected")
         self.btn_export_selected.clicked.connect(self.start_export_selected)
-        self.btn_export_selected.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+        _make_bold(self.btn_export_selected)
         self.btn_export_selected.setEnabled(False) # Enabled after parsing
 
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        
         export_control_layout.addWidget(self.checkbox_raw)
-        export_control_layout.addWidget(self.progress_bar)
+        export_control_layout.addStretch()
         export_control_layout.addWidget(self.btn_export_selected)
 
         main_layout.addLayout(export_control_layout)
 
-        # Status Bar
+        # Status Bar, with the progress bar at its right edge
         self.status_bar = self.statusBar()
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMaximumWidth(220)
+        self.progress_bar.setVisible(False)
+        self.status_bar.addPermanentWidget(self.progress_bar)
 
     # --- UI Logic Methods ---
     def _on_input_changed(self, text: str):
@@ -622,9 +684,8 @@ class MainWindow(QMainWindow):
         """Fill the segment table with the given (pre-sorted) entry list."""
         block_size = self.current_parser.master_block.size_data_block
 
-        # Assign alternating background colors per calendar day
-        DAY_COLORS = [QBrush(QColor("#3e3e3e")), QBrush(QColor("#4c4c4c"))]
-        row_brushes: list[QBrush] = []
+        # Band alternate calendar days (painted by the delegate from the palette)
+        row_days: list[int] = []
         prev_date = None
         day_index = -1
         for entry in entries:
@@ -632,51 +693,70 @@ class MainWindow(QMainWindow):
             if current_date != prev_date:
                 day_index += 1
                 prev_date = current_date
-            row_brushes.append(DAY_COLORS[day_index % 2])
+            row_days.append(day_index % 2)
+
+        mono = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+        right = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        dim = self.table_segments.palette().color(QPalette.ColorRole.PlaceholderText)
 
         self.table_segments.setRowCount(len(entries))
         self._row_by_offset = {}
         for row, entry in enumerate(entries):
             self._row_by_offset[entry.offset_datablock] = row
-            brush = row_brushes[row]
+            day = row_days[row]
 
-            def _item(text="", _brush=brush):
+            def _item(text="", _day=day, muted=False):
                 it = QTableWidgetItem(text)
-                it.setBackground(_brush)
+                it.setData(DAY_ROLE, _day)
                 it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                if muted:
+                    it.setForeground(dim)
                 return it
 
             # Preview placeholder (thumbnail filled in asynchronously)
             preview_item = _item()
             self.table_segments.setItem(row, 0, preview_item)
 
-            ch_item = QTableWidgetItem(f"{entry.channel:02d}")
-            ch_item.setBackground(_channel_brush(entry.channel))
-            ch_item.setFlags(ch_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            ch_item = _item(f"{entry.channel:02d}")
+            ch_item.setIcon(_channel_dot(entry.channel))
             self.table_segments.setItem(row, 1, ch_item)
 
-            start_time = f"{entry.start_timestamp:%Y-%m-%d %H:%M:%S}" if entry.start_timestamp else "N/A"
-            start_item = _item(start_time)
+            # Blocks still being written when the DVR stopped carry no timestamps
+            if entry.start_timestamp:
+                start_item = _item(f"{entry.start_timestamp:%Y-%m-%d %H:%M:%S}")
+            else:
+                start_item = _item("In progress" if entry.recording else "N/A", muted=True)
+                font = start_item.font()
+                font.setItalic(True)
+                start_item.setFont(font)
             start_item.setData(Qt.ItemDataRole.UserRole + 1, entry)  # entry reference for export
             self.table_segments.setItem(row, 2, start_item)
 
-            end_time = f"{entry.end_timestamp:%Y-%m-%d %H:%M:%S}" if entry.end_timestamp else "N/A"
-            self.table_segments.setItem(row, 3, _item(end_time))
+            if entry.end_timestamp:
+                end_item = _item(f"{entry.end_timestamp:%Y-%m-%d %H:%M:%S}")
+            else:
+                end_item = _item("—", muted=True)
+            self.table_segments.setItem(row, 3, end_item)
 
-            self.table_segments.setItem(row, 4, _item("Yes" if entry.recording else "No"))
-            self.table_segments.setItem(row, 5, _item(f"0x{entry.offset_datablock:X}"))
+            recording_item = _item("In progress" if entry.recording else "—", muted=not entry.recording)
+            self.table_segments.setItem(row, 4, recording_item)
+            offset_item = _item(f"0x{entry.offset_datablock:X}")
+            offset_item.setFont(mono)
+            offset_item.setTextAlignment(right)
+            self.table_segments.setItem(row, 5, offset_item)
 
-            # Serve from cache or kick off thumbnail generation
-            if not entry.recording:
-                cache_key = (self.current_parser.source_path, entry.offset_datablock)
-                if cache_key in self._thumb_cache:
-                    preview_item.setData(Qt.ItemDataRole.UserRole, self._thumb_cache[cache_key])
-                elif cache_key not in self._thumb_pending:  # re-sorting must not re-queue
-                    self._thumb_pending.add(cache_key)
-                    worker = ThumbnailWorker(self.current_parser.source_path, entry, block_size)
-                    worker.signals.ready.connect(self._on_thumbnail_ready)
-                    worker.signals.done.connect(self._on_thumbnail_done)
-                    self.thumb_pool.start(worker)
+            # Serve from cache or kick off thumbnail generation. In-progress blocks
+            # are included: their start is usually written already; if not, the
+            # worker simply yields no image and the cell stays empty.
+            cache_key = (self.current_parser.source_path, entry.offset_datablock)
+            if cache_key in self._thumb_cache:
+                preview_item.setData(Qt.ItemDataRole.UserRole, self._thumb_cache[cache_key])
+            elif cache_key not in self._thumb_pending:  # re-sorting must not re-queue
+                self._thumb_pending.add(cache_key)
+                worker = ThumbnailWorker(self.current_parser.source_path, entry, block_size)
+                worker.signals.ready.connect(self._on_thumbnail_ready)
+                worker.signals.done.connect(self._on_thumbnail_done)
+                self.thumb_pool.start(worker)
 
         self.table_segments.resizeColumnsToContents()
         self.table_segments.setColumnWidth(0, 170)  # keep preview column fixed after resize
@@ -788,80 +868,19 @@ class MainWindow(QMainWindow):
     def _on_export_skipped(self, count: int):
         self._export_io_errors = count
 
-    # --- Modern Styling (QSS) ---
-    def _apply_style(self):
-        """Applies a simple dark theme using Qt Style Sheets."""
-        self.setStyleSheet("""
-            QMainWindow {
-                background-color: #2e2e2e;
-                color: #ffffff;
-            }
-            QLabel, QCheckBox {
-                color: #cccccc;
-            }
-            QPushButton {
-                background-color: #4CAF50;
-                color: white;
-                border: 1px solid #388E3C;
-                padding: 8px 15px;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #45a049;
-            }
-            QPushButton:disabled {
-                background-color: #555555;
-                color: #999999;
-            }
-            QPushButton#btn_file {
-                background-color: #5a5a5a;
-                border: 1px solid #444444;
-            }
-            QPushButton#btn_file:hover {
-                background-color: #6a6a6a;
-            }
-            QPushButton#btn_device {
-                background-color: #1a6eb5;
-                border: 1px solid #144f80;
-            }
-            QPushButton#btn_device:hover {
-                background-color: #1e80d0;
-            }
-            QLineEdit {
-                background-color: #3e3e3e;
-                color: white;
-                border: 1px solid #555555;
-                padding: 5px;
-            }
-            QTableWidget {
-                background-color: #3e3e3e;
-                color: white;
-                gridline-color: #555555;
-                selection-background-color: #1e87f0; /* Blue highlight */
-                border: 1px solid #555555;
-            }
-            QHeaderView::section {
-                background-color: #505050;
-                color: white;
-                padding: 4px;
-                border: 1px solid #444444;
-            }
-            QProgressBar {
-                border: 1px solid #555555;
-                border-radius: 5px;
-                text-align: center;
-                color: white;
-                background-color: #3e3e3e;
-            }
-            QProgressBar::chunk {
-                background-color: #4CAF50;
-                margin: 0px;
-            }
-        """)
-
 
 if __name__ == "__main__":
+    # On GNOME, take fonts, colors and file dialogs from GTK. Other desktops
+    # (e.g. KDE) already provide their own platform theme; an explicit
+    # QT_QPA_PLATFORMTHEME from the user always wins.
+    if "GNOME" in os.environ.get("XDG_CURRENT_DESKTOP", "").upper():
+        os.environ.setdefault("QT_QPA_PLATFORMTHEME", "gtk3")
     app = QApplication(sys.argv)
+    app.setApplicationDisplayName("HikExtractor")
+    app.setDesktopFileName("hikextractor")
+    app.setWindowIcon(QIcon.fromTheme("camera-video"))
+    if app.style().name().lower() == "windows":  # the legacy Win95 look: prefer Fusion
+        app.setStyle("Fusion")
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
