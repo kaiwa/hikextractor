@@ -11,6 +11,8 @@ The format found in the HD was not the same as the described in the paper, but t
 
 The script has also been successfully tested on the HDD from a DS-7208HQHI-SH/A DVR model, that had the real-time clock fail due to age and was recording with semi-random timestamps due to multiple power failures. For this use case the `--physical-order` option was added, to retrieve video data in the order it was stored on the HD (with the hope that the recording just reuses the same storage area over and over, while leaving timestamps run out of order).
 
+The changes in this version (including the GUI) were also tested with the Hikvision DS-7104NI-S1/W/KIT WiFi recorder.
+
 It was tested on windows and linux, using a DD image of the HD as input.
 It uses FFmpeg to mux the video into MP4 files, so FFmpeg should be in the os search path (ffmpeg.exe in the same folder as the script is enough). You can get a copy of FFmpeg here: [FFmpeg](https://ffmpeg.org/download.html). For linux, you can use your package manager to install it.
 
