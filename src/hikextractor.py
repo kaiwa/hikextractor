@@ -273,8 +273,10 @@ def export_footage_from_block(datablock, outfile):
         if start_offset < 0:
             return
 
-def _write_temp(data, suffix):
-    fd, path = tempfile.mkstemp(suffix=suffix, dir=tempfile.gettempdir())
+def _write_temp(data, suffix, dir=None):
+    # /tmp is often a RAM-backed tmpfs; blocks are ~1 GB, so callers pass the
+    # destination folder to keep temp files on disk instead of in memory.
+    fd, path = tempfile.mkstemp(suffix=suffix, dir=dir or tempfile.gettempdir())
     with os.fdopen(fd, "wb") as f:
         f.write(data)
     return path
@@ -312,9 +314,19 @@ def _find_first_annexb_idr(b):
         pos = nalu_start + 1
     return -1
 
+# Re-encode fallbacks (libx264) would otherwise spawn ~1.5 threads per core
+# and saturate the whole machine; leave half the cores free.
+_ENC_THREADS = str(max(1, (os.cpu_count() or 2) // 2))
+
+def _lower_priority():
+    # Runs in the ffmpeg child before exec: lowest CPU priority (I/O priority
+    # follows CPU niceness by default), so the desktop stays responsive.
+    os.nice(19)
+
 def _run(cmd):
     # helper to run ffmpeg/ffprobe
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                       preexec_fn=_lower_priority)
     return p.returncode, p.stdout.decode("utf-8", "ignore"), p.stderr.decode("utf-8", "ignore")
 
 def export_file(mm_slice, filename, raw=False):
@@ -345,7 +357,7 @@ def export_file(mm_slice, filename, raw=False):
         kind = "h264"
 
     # temp input
-    in_path = _write_temp(cut, ".bin")
+    in_path = _write_temp(cut, ".bin", dir=os.path.dirname(os.path.abspath(filename)))
 
     try:
         if raw:
@@ -374,7 +386,7 @@ def export_file(mm_slice, filename, raw=False):
                         "-fflags", "+genpts",
                         "-i", in_path,
                         "-map", "0:v:0",
-                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-threads", _ENC_THREADS,
                         h264_path
                     ]
                     _run(cmd1b)
@@ -398,7 +410,7 @@ def export_file(mm_slice, filename, raw=False):
                             "-fflags", "+genpts",
                             "-i", ts_path,
                             "-map", "0:v:0",
-                            "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                            "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-threads", _ENC_THREADS,
                             h264_path
                         ]
                         _run(cmd3)
@@ -433,7 +445,7 @@ def export_file(mm_slice, filename, raw=False):
                     "-fflags", "+genpts",
                     "-i", in_path,
                     "-map", "0:v:0",
-                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-threads", _ENC_THREADS,
                     "-movflags", "+faststart",
                     filename
                 ]
@@ -458,7 +470,7 @@ def export_file(mm_slice, filename, raw=False):
                         "-fflags", "+genpts",
                         "-i", ts_path,
                         "-map", "0:v:0",
-                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-threads", _ENC_THREADS,
                         "-movflags", "+faststart",
                         filename
                     ]
@@ -487,7 +499,7 @@ def export_file(mm_slice, filename, raw=False):
                     "-fflags", "+genpts",
                     "-analyzeduration", "200M", "-probesize", "200M",
                     "-f", "h264", "-i", in_path,
-                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-threads", _ENC_THREADS,
                     "-movflags", "+faststart",
                     filename
                 ]
@@ -508,7 +520,7 @@ def export_file(mm_slice, filename, raw=False):
                         "ffmpeg", "-y",
                         "-analyzeduration", "200M", "-probesize", "200M",
                         "-i", ts_path,
-                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-threads", _ENC_THREADS,
                         "-movflags", "+faststart",
                         filename
                     ]
